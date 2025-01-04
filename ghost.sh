@@ -2,85 +2,101 @@
 
 set -euo pipefail
 
+# Kolory dla lepszego logowania
+GREEN="\e[32m"
+RED="\e[31m"
+YELLOW="\e[33m"
+NC="\e[0m" # No Color
+
 # Funkcja logowania zdarzeń
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+log_info() {
+  echo -e "${GREEN}[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1${NC}"
 }
 
-# Funkcja generowania losowego hasła
+log_warning() {
+  echo -e "${YELLOW}[WARNING] $(date '+%Y-%m-%d %H:%M:%S') - $1${NC}"
+}
+
+log_error() {
+  echo -e "${RED}[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1${NC}" >&2
+}
+
+# Funkcja generowania losowego hasła z minimalnymi wymaganiami
 generate_password() {
-  tr -dc 'A-Za-z0-9!@#$%^&*()-_=+{}[]' < /dev/urandom | head -c 24
+  local password
+  password=$(tr -dc 'A-Za-z0-9!@#$%^&*()-_=+{}[]' < /dev/urandom | head -c 24)
+  if [[ ! "$password" =~ [A-Z] || ! "$password" =~ [a-z] || ! "$password" =~ [0-9] || ! "$password" =~ [!@#$%^&*()-_=+{}[]] ]]; then
+    log_warning "Wygenerowane hasło nie spełnia minimalnych wymagań. Generowanie ponowne..."
+    generate_password
+  else
+    echo "$password"
+  fi
 }
 
-# Wstępna konfiguracja
-log "Rozpoczynam konfigurację środowiska Docker dla Ghost..."
+# Funkcja sprawdzania uprawnień
+require_root() {
+  if [[ $(id -u) -ne 0 ]]; then
+    log_error "Ten skrypt wymaga uprawnień administratora. Uruchom ponownie jako root lub użyj sudo."
+    exit 1
+  fi
+}
 
-# 1. Instalacja Docker i Docker Compose
-log "Instalacja Docker i Docker Compose..."
-sudo apt update
-sudo apt install -y docker.io docker-compose
+# Funkcja tworzenia użytkownika z uprawnieniami sudo
+create_sudo_user() {
+  local username="$1"
+  if id "$username" &>/dev/null; then
+    log_warning "Użytkownik $username już istnieje."
+  else
+    log_info "Tworzenie nowego użytkownika: $username"
+    password=$(generate_password)
+    useradd -m -s /bin/bash "$username"
+    echo "$username:$password" | chpasswd
+    usermod -aG sudo "$username"
+    log_info "Utworzono użytkownika $username z hasłem: $password"
+  fi
+}
 
-# 2. Tworzenie struktury katalogów
-log "Tworzenie struktury katalogów..."
-mkdir -p /ghost-docker
-cd /ghost-docker
+# Funkcja instalacji wymaganych pakietów
+install_packages() {
+  log_info "Sprawdzanie i instalacja wymaganych pakietów..."
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt install -y docker.io docker-compose curl unzip pwgen jq mysql-client nginx certbot
+  log_info "Pakiety zostały zainstalowane."
+}
 
-# 3. Utworzenie pliku Dockerfile
-log "Tworzenie Dockerfile..."
+# Funkcja konfiguracji katalogów
+setup_directories() {
+  log_info "Tworzenie struktury katalogów..."
+  mkdir -p /ghost-docker
+  cd /ghost-docker
+}
 
-cat << 'EOF' > Dockerfile
-# Wybieramy obraz z Node.js (Alpine dla mniejszego rozmiaru)
+# Funkcja tworzenia plików konfiguracyjnych
+create_files() {
+  log_info "Tworzenie plików konfiguracyjnych..."
+
+  cat << 'EOF' > Dockerfile
 FROM node:18-alpine AS build
-
-# Instalacja zależności
-RUN apk update && apk add --no-cache \
-    curl \
-    unzip \
-    pwgen \
-    jq \
-    mysql-client \
-    nginx \
+RUN apk update && apk add --no-cache curl unzip pwgen jq mysql-client nginx \
     && rm -rf /var/cache/apk/*
-
-# Instalacja Ghost-CLI
 RUN npm install -g ghost-cli
-
-# Ustawienia katalogów
 WORKDIR /var/www/ghost
-
-# Instalacja Ghost
 RUN ghost install --no-prompt --process systemd --no-setup-ssl --no-setup-nginx
-
-# Kopiowanie plików do obrazu
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
-
-# Uruchamianie kontenera
 CMD ["/start.sh"]
 EOF
 
-# 4. Utworzenie pliku startowego `start.sh`
-log "Tworzenie skryptu startowego..."
-
-cat << 'EOF' > start.sh
+  cat << 'EOF' > start.sh
 #!/bin/bash
-
-# Uruchamiamy Nginx
 service nginx start
-
-# Uruchamiamy Ghost
 ghost start
-
-# Logowanie procesu
 echo "Ghost uruchomiony na porcie 2368"
 EOF
 
-chmod +x start.sh
+  chmod +x start.sh
 
-# 5. Utworzenie pliku konfiguracyjnego Nginx
-log "Tworzenie konfiguracji Nginx..."
-
-cat << 'EOF' > ghost_nginx_config
+  cat << 'EOF' > ghost_nginx_config
 server {
     listen 80;
     server_name example.com;
@@ -92,13 +108,11 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Ochrona przed atakami DDoS i zwiększenie bezpieczeństwa
         proxy_set_header X-Frame-Options SAMEORIGIN;
         proxy_set_header X-Content-Type-Options nosniff;
         proxy_set_header Referrer-Policy strict-origin-when-cross-origin;
         proxy_set_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self';";
 
-        # Optymalizacja cache dla zasobów statycznych
         location ~* \.(jpg|jpeg|png|gif|css|js|woff|woff2|ttf|svg|ico)$ {
             expires 1y;
             add_header Cache-Control "public, immutable, no-transform, max-age=31536000";
@@ -109,30 +123,23 @@ server {
     ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 
-    # HSTS: Wymusza HTTPS
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
-
-    # SSL Stapling
     ssl_stapling on;
     ssl_stapling_verify on;
     ssl_trusted_certificate /etc/letsencrypt/live/example.com/chain.pem;
 }
 EOF
 
-# 6. Utworzenie pliku `docker-compose.yml`
-log "Tworzenie pliku docker-compose.yml..."
-
-cat << 'EOF' > docker-compose.yml
+  cat << 'EOF' > docker-compose.yml
 version: '3.8'
-
 services:
   mysql:
     image: mysql:5.7
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-$(generate_password)}
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-$(generate_password)}"
       MYSQL_DATABASE: 'ghost_db'
       MYSQL_USER: 'ghost_user'
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-$(generate_password)}
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:-$(generate_password)}"
     volumes:
       - mysql_data:/var/lib/mysql
     networks:
@@ -147,7 +154,7 @@ services:
       database__client: mysql
       database__connection__host: mysql
       database__connection__user: ghost_user
-      database__connection__password: ${MYSQL_PASSWORD:-$(generate_password)}
+      database__connection__password: "${MYSQL_PASSWORD:-$(generate_password)}"
       database__connection__database: ghost_db
     volumes:
       - ghost_data:/var/www/ghost
@@ -200,33 +207,34 @@ volumes:
   ghost_data:
 EOF
 
-# 7. Utworzenie katalogu na certyfikaty SSL
-log "Tworzenie katalogu SSL..."
-
-mkdir -p ssl_config
-
-# 8. Utworzenie skryptu do generowania SSL
-log "Tworzenie skryptu certbot.sh..."
-
-cat << 'EOF' > ssl_config/certbot.sh
+  mkdir -p ssl_config
+  cat << 'EOF' > ssl_config/certbot.sh
 #!/bin/bash
-
-# Wykonaj Certbot do utworzenia certyfikatu
 certbot --nginx -d example.com --non-interactive --agree-tos --email admin@example.com
-
-# Dodaj cron do odnowienia certyfikatu
 echo "0 0 * * * root certbot renew --quiet" >> /etc/crontab
 EOF
 
-chmod +x ssl_config/certbot.sh
+  chmod +x ssl_config/certbot.sh
+}
 
-# 9. Budowa obrazu Docker
-log "Budowa obrazu Docker..."
-docker-compose build
+# Funkcja budowy obrazu Docker i uruchomienia kontenerów
+build_and_run() {
+  log_info "Budowa obrazu Docker..."
+  docker-compose build
 
-# 10. Uruchomienie aplikacji w Dockerze
-log "Uruchamianie aplikacji w Dockerze..."
-docker-compose up -d
+  log_info "Uruchamianie aplikacji w Dockerze..."
+  docker-compose up -d
+}
 
-# Finalizacja
-log "Instalacja zakończona. Ghost działa w kontenerze Docker. Przejdź do 'http://localhost' lub 'https://example.com' w przeglądarce."
+# Główna logika skryptu
+main() {
+  require_root
+  create_sudo_user "ghostadmin"
+  install_packages
+  setup_directories
+  create_files
+  build_and_run
+  log_info "Instalacja zakończona. Ghost działa w kontenerze Docker. Przejdź do 'http://localhost' lub 'https://example.com' w przeglądarce."
+}
+
+main
